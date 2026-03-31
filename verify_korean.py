@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """수집된 한국어 후보 토큰을 Claude count_tokens API로 검증한다.
 
-Sandwich counting 기법으로 각 후보가 Claude에서 단일 토큰인지 확인.
-Bedrock(70%)과 Anthropic(30%)을 병렬로 분담 처리.
+Bedrock 키 N개를 각각 별도 프로세스로 분리 + Anthropic 프로세스 1개.
+multiprocessing으로 env var 경쟁 문제를 완전히 제거.
 
 Usage:
     export ANTHROPIC_API_KEY=sk-ant-...
-    export BEDROCK_TOKEN=ABSK...
+    export BEDROCK_TOKENS="key1,key2,key3,key4"
     python verify_korean.py
 """
 
@@ -14,24 +14,18 @@ import json
 import os
 import sys
 import time
-import threading
+import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import boto3
-import anthropic
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-BEDROCK_TOKEN = os.environ.get("BEDROCK_TOKEN", "")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
 BEDROCK_MODEL = "anthropic.claude-sonnet-4-20250514-v1:0"
 ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 
-BEDROCK_WORKERS = 40
-ANTHROPIC_WORKERS = 10
+WORKERS_PER_KEY = 5
+ANTHROPIC_WORKERS = 5
 MAX_RETRIES = 4
 BATCH_SIZE = 500
 SANDWICH_MARKER = "§"
@@ -40,133 +34,95 @@ CANDIDATES_FILE = "collected_vocab.json"
 CHECKPOINT_FILE = "verify_checkpoint.json"
 RESULTS_FILE = "verified_korean.json"
 
-# ---------------------------------------------------------------------------
-# API clients
-# ---------------------------------------------------------------------------
-
-os.environ["AWS_BEARER_TOKEN_BEDROCK"] = BEDROCK_TOKEN
-bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
-
-anthropic_client = None
-if ANTHROPIC_KEY:
-    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 # ---------------------------------------------------------------------------
-# Sandwich counting with retry
+# Worker process: Bedrock
 # ---------------------------------------------------------------------------
 
-def _bedrock_raw(text: str) -> int:
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = bedrock_client.count_tokens(
-                modelId=BEDROCK_MODEL,
-                input={
-                    "converse": {
-                        "messages": [
-                            {"role": "user", "content": [{"text": text}]}
-                        ]
-                    }
-                },
-            )
-            return resp["inputTokens"]
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
-            else:
-                raise
+def bedrock_worker(token: str, candidates: list[str], result_queue: mp.Queue):
+    """별도 프로세스에서 Bedrock 키 하나로 검증."""
+    import boto3
 
+    os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
+    client = boto3.client("bedrock-runtime", region_name="us-east-1")
 
-def _anthropic_raw(text: str) -> int:
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = anthropic_client.messages.count_tokens(
-                model=ANTHROPIC_MODEL,
-                messages=[{"role": "user", "content": text}],
-            )
-            return resp.input_tokens
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
-            else:
-                raise
-
-
-_baseline_cache = {}
-_baseline_lock = threading.Lock()
-
-
-def get_baseline(raw_fn, name: str) -> int:
-    with _baseline_lock:
-        if name not in _baseline_cache:
-            _baseline_cache[name] = raw_fn(SANDWICH_MARKER + SANDWICH_MARKER)
-        return _baseline_cache[name]
-
-
-def check_bedrock(candidate: str) -> tuple[str, bool | None]:
-    """Bedrock으로 단일 토큰 여부 확인."""
-    try:
-        baseline = get_baseline(_bedrock_raw, "bedrock")
-        sandwiched = _bedrock_raw(SANDWICH_MARKER + candidate + SANDWICH_MARKER)
-        return candidate, (sandwiched - baseline) == 1
-    except Exception:
-        return candidate, None
-
-
-def check_anthropic(candidate: str) -> tuple[str, bool | None]:
-    """Anthropic으로 단일 토큰 여부 확인."""
-    try:
-        baseline = get_baseline(_anthropic_raw, "anthropic")
-        sandwiched = _anthropic_raw(SANDWICH_MARKER + candidate + SANDWICH_MARKER)
-        return candidate, (sandwiched - baseline) == 1
-    except Exception:
-        return candidate, None
-
-
-# ---------------------------------------------------------------------------
-# Progress tracking
-# ---------------------------------------------------------------------------
-
-class Progress:
-    def __init__(self, total: int):
-        self.total = total
-        self.done = 0
-        self.hits = 0
-        self.errors = 0
-        self.lock = threading.Lock()
-        self.start_time = time.time()
-
-    def update(self, is_hit: bool | None):
-        with self.lock:
-            self.done += 1
-            if is_hit is True:
-                self.hits += 1
-            elif is_hit is None:
-                self.errors += 1
-
-            if self.done % 100 == 0 or self.done == self.total:
-                elapsed = time.time() - self.start_time
-                rate = self.done / elapsed if elapsed > 0 else 0
-                checked_ok = self.done - self.errors
-                hit_rate = self.hits / max(checked_ok, 1) * 100
-                eta = (self.total - self.done) / rate if rate > 0 else 0
-                print(
-                    f"\r  [{self.done:>7,}/{self.total:,}] "
-                    f"hits={self.hits:,} ({hit_rate:.1f}%) "
-                    f"err={self.errors} "
-                    f"rate={rate:.0f}/s "
-                    f"ETA={eta/60:.1f}min",
-                    end="", flush=True,
+    def raw(text):
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = client.count_tokens(
+                    modelId=BEDROCK_MODEL,
+                    input={"converse": {"messages": [
+                        {"role": "user", "content": [{"text": text}]}
+                    ]}},
                 )
+                return resp["inputTokens"]
+            except Exception:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(1 + attempt)
+                else:
+                    raise
+
+    baseline = raw(SANDWICH_MARKER + SANDWICH_MARKER)
+
+    def check(candidate):
+        try:
+            n = raw(SANDWICH_MARKER + candidate + SANDWICH_MARKER)
+            return candidate, (n - baseline) == 1
+        except Exception:
+            return candidate, None
+
+    with ThreadPoolExecutor(max_workers=WORKERS_PER_KEY) as pool:
+        futures = {pool.submit(check, c): c for c in candidates}
+        for future in as_completed(futures):
+            result_queue.put(future.result())
+
+
+# ---------------------------------------------------------------------------
+# Worker process: Anthropic
+# ---------------------------------------------------------------------------
+
+def anthropic_worker(api_key: str, candidates: list[str], result_queue: mp.Queue):
+    """별도 프로세스에서 Anthropic API로 검증."""
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    def raw(text):
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = client.messages.count_tokens(
+                    model=ANTHROPIC_MODEL,
+                    messages=[{"role": "user", "content": text}],
+                )
+                return resp.input_tokens
+            except Exception:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(1 + attempt)
+                else:
+                    raise
+
+    baseline = raw(SANDWICH_MARKER + SANDWICH_MARKER)
+
+    def check(candidate):
+        try:
+            n = raw(SANDWICH_MARKER + candidate + SANDWICH_MARKER)
+            return candidate, (n - baseline) == 1
+        except Exception:
+            return candidate, None
+
+    with ThreadPoolExecutor(max_workers=ANTHROPIC_WORKERS) as pool:
+        futures = {pool.submit(check, c): c for c in candidates}
+        for future in as_completed(futures):
+            result_queue.put(future.result())
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def load_candidates() -> list[str]:
+def load_candidates():
     with open(CANDIDATES_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-
     candidates = []
     for c in data["korean_candidates"]:
         if not c or not c.strip():
@@ -177,7 +133,7 @@ def load_candidates() -> list[str]:
     return candidates
 
 
-def load_checkpoint() -> tuple[set[str], set[str]]:
+def load_checkpoint():
     if not os.path.exists(CHECKPOINT_FILE):
         return set(), set()
     with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
@@ -185,7 +141,7 @@ def load_checkpoint() -> tuple[set[str], set[str]]:
     return set(data.get("verified", [])), set(data.get("checked", []))
 
 
-def save_checkpoint(verified: set[str], checked: set[str]):
+def save_checkpoint(verified, checked):
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
         json.dump({
             "verified": sorted(verified),
@@ -193,7 +149,7 @@ def save_checkpoint(verified: set[str], checked: set[str]):
         }, f, ensure_ascii=False)
 
 
-def save_results(verified: set[str], checked: set[str]):
+def save_results(verified, checked):
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump({
             "verified": sorted(verified),
@@ -207,10 +163,21 @@ def save_results(verified: set[str], checked: set[str]):
 
 
 def main():
-    print("=== 한국어 토큰 검증 시작 ===\n")
+    bedrock_tokens = [t.strip() for t in os.environ.get("BEDROCK_TOKENS", "").split(",") if t.strip()]
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    n_bedrock = len(bedrock_tokens)
+    has_anthropic = bool(anthropic_key)
+    total_channels = n_bedrock + (1 if has_anthropic else 0)
+
+    print(f"\n=== 한국어 토큰 검증 ===")
+    print(f"  Bedrock 키 {n_bedrock}개 × {WORKERS_PER_KEY}w = {n_bedrock * WORKERS_PER_KEY}w")
+    if has_anthropic:
+        print(f"  Anthropic {ANTHROPIC_WORKERS}w")
+    print(f"  총 {n_bedrock * WORKERS_PER_KEY + (ANTHROPIC_WORKERS if has_anthropic else 0)} workers")
 
     all_candidates = load_candidates()
-    print(f"  전체 후보: {len(all_candidates):,}개")
+    print(f"\n  전체 후보: {len(all_candidates):,}개")
 
     verified, checked = load_checkpoint()
     if checked:
@@ -224,67 +191,101 @@ def main():
         save_results(verified, checked)
         return
 
-    # 빈도 기반 정렬 (여러 모델에서 등장하는 토큰 우선)
+    # 빈도 기반 정렬
     with open(CANDIDATES_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     sources = data.get("korean_with_sources", {})
     remaining.sort(key=lambda t: len(sources.get(t, [])), reverse=True)
 
-    # 70/30 분할
-    split_idx = int(len(remaining) * 0.7)
-    bedrock_batch = remaining[:split_idx]
-    anthropic_batch = remaining[split_idx:]
+    # 채널별 균등 분배
+    chunks = [[] for _ in range(total_channels)]
+    for i, c in enumerate(remaining):
+        chunks[i % total_channels].append(c)
 
-    # 베이스라인 워밍업
-    print("\n  베이스라인 측정 중...", end=" ", flush=True)
-    b_baseline = get_baseline(_bedrock_raw, "bedrock")
-    print(f"Bedrock={b_baseline}", end=" ", flush=True)
-    if anthropic_client:
-        a_baseline = get_baseline(_anthropic_raw, "anthropic")
-        print(f"Anthropic={a_baseline}")
-    else:
-        print("(Anthropic 없음, Bedrock만 사용)")
-        bedrock_batch = remaining
-        anthropic_batch = []
+    for i, chunk in enumerate(chunks):
+        label = f"Bedrock#{i+1}" if i < n_bedrock else "Anthropic"
+        print(f"  {label}: {len(chunk):,}개")
 
-    print(f"\n  Bedrock {BEDROCK_WORKERS}w × {len(bedrock_batch):,}개"
-          f" + Anthropic {ANTHROPIC_WORKERS}w × {len(anthropic_batch):,}개\n")
+    # 결과 큐
+    result_queue = mp.Queue()
 
-    progress = Progress(len(remaining))
-    result_lock = threading.Lock()
+    # 프로세스 시작
+    processes = []
+    for i in range(n_bedrock):
+        p = mp.Process(target=bedrock_worker, args=(bedrock_tokens[i], chunks[i], result_queue))
+        p.start()
+        processes.append(p)
+        print(f"  Bedrock#{i+1} 프로세스 시작 (PID {p.pid})")
+
+    if has_anthropic:
+        p = mp.Process(target=anthropic_worker, args=(anthropic_key, chunks[n_bedrock], result_queue))
+        p.start()
+        processes.append(p)
+        print(f"  Anthropic 프로세스 시작 (PID {p.pid})")
+
+    print(f"\n  검증 시작...\n")
+
+    # 결과 수집
+    total = len(remaining)
+    done = 0
+    hits = 0
+    errors = 0
     batch_count = 0
+    start_time = time.time()
 
-    def on_result(candidate: str, result: bool | None):
-        nonlocal batch_count
-        with result_lock:
+    alive = True
+    while alive:
+        # 큐에서 결과 꺼내기
+        try:
+            candidate, result = result_queue.get(timeout=1)
+        except Exception:
+            # 모든 프로세스가 끝났는지 확인
+            alive = any(p.is_alive() for p in processes)
+            continue
+
+        checked.add(candidate)
+        if result is True:
+            verified.add(candidate)
+            hits += 1
+        elif result is None:
+            errors += 1
+
+        done += 1
+        batch_count += 1
+        if batch_count >= BATCH_SIZE:
+            save_checkpoint(verified, checked)
+            batch_count = 0
+
+        if done % 200 == 0 or done == total:
+            elapsed = time.time() - start_time
+            rate = done / elapsed if elapsed > 0 else 0
+            checked_ok = done - errors
+            hit_rate = hits / max(checked_ok, 1) * 100
+            eta = (total - done) / rate if rate > 0 else 0
+            print(
+                f"\r  [{done:>7,}/{total:,}] "
+                f"hits={hits:,} ({hit_rate:.1f}%) "
+                f"err={errors} "
+                f"rate={rate:.0f}/s "
+                f"ETA={eta/60:.1f}min",
+                end="", flush=True,
+            )
+
+    # 큐에 남은 결과 비우기
+    while not result_queue.empty():
+        try:
+            candidate, result = result_queue.get_nowait()
             checked.add(candidate)
             if result is True:
                 verified.add(candidate)
-            batch_count += 1
-            if batch_count % BATCH_SIZE == 0:
-                save_checkpoint(verified, checked)
-        progress.update(result)
+                hits += 1
+            done += 1
+        except Exception:
+            break
 
-    # 두 풀을 동시에 실행
-    bedrock_pool = ThreadPoolExecutor(max_workers=BEDROCK_WORKERS, thread_name_prefix="bedrock")
-    anthropic_pool = ThreadPoolExecutor(max_workers=ANTHROPIC_WORKERS, thread_name_prefix="anthropic")
+    for p in processes:
+        p.join(timeout=5)
 
-    all_futures = {}
-    for c in bedrock_batch:
-        f = bedrock_pool.submit(check_bedrock, c)
-        all_futures[f] = c
-    for c in anthropic_batch:
-        f = anthropic_pool.submit(check_anthropic, c)
-        all_futures[f] = c
-
-    for future in as_completed(all_futures):
-        candidate, result = future.result()
-        on_result(candidate, result)
-
-    bedrock_pool.shutdown(wait=False)
-    anthropic_pool.shutdown(wait=False)
-
-    # 최종 저장
     print("\n")
     save_checkpoint(verified, checked)
     save_results(verified, checked)
