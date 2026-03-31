@@ -3,4 +3,6 @@ bazel-*
 *.pt
 verify_checkpoint.json
 verified_korean.json
+morpheme_checkpoint.json
+morpheme_verified.json
 test_results.json

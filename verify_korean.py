@@ -30,9 +30,9 @@ MAX_RETRIES = 4
 BATCH_SIZE = 500
 SANDWICH_MARKER = "§"
 
-CANDIDATES_FILE = "collected_vocab.json"
-CHECKPOINT_FILE = "verify_checkpoint.json"
-RESULTS_FILE = "verified_korean.json"
+CANDIDATES_FILE = "morpheme_candidates.json"
+CHECKPOINT_FILE = "morpheme_checkpoint.json"
+RESULTS_FILE = "morpheme_verified.json"
 
 
 # ---------------------------------------------------------------------------
