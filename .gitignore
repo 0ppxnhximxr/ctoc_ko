@@ -1,3 +1,6 @@
 bazel-*
 *.jsonl
 *.pt
+verify_checkpoint.json
+verified_korean.json
+test_results.json
