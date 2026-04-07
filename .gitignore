@@ -1,3 +1,6 @@
 bazel-*
 *.jsonl
 *.pt
+/ctoc
+vocab_data.cc
+vocab_data.h
